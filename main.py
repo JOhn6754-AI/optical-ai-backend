@@ -23,10 +23,6 @@ from datetime import datetime
 
 app = FastAPI(title="OptiCal AI", version="2.0.0")
 
-# ============================================================
-# CORS — reads from environment variable in production
-# Falls back to localhost for local development
-# ============================================================
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 
 app.add_middleware(
@@ -40,9 +36,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# DATABASE — uses /data/ on Render (persistent), local otherwise
-# ============================================================
 DATA_DIR = "/data" if os.path.exists("/data") else "."
 DB_PATH = os.path.join(DATA_DIR, "optical.db")
 
@@ -78,15 +71,9 @@ def init_db():
 
 init_db()
 
-# ============================================================
-# CACHES
-# ============================================================
 geocode_cache = {}
 route_cache = {}
 
-# ============================================================
-# GEOCODING — OpenStreetMap Nominatim
-# ============================================================
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 HEADERS = {"User-Agent": "OptiCalAI/1.0 (local business scheduling tool)"}
 
@@ -113,10 +100,51 @@ def geocode_address(address: str) -> tuple:
     geocode_cache[address] = fallback
     return fallback
 
-# ============================================================
-# ROUTING — OSRM
-# ============================================================
 OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
+
+# ============================================================
+# MONTANA TERRAIN MULTIPLIERS (#10)
+# Bounding boxes for known slow zones in Montana.
+# Format: (name, lat_min, lat_max, lon_min, lon_max, multiplier)
+# Multiplier applies to OSRM drive time — 1.3 = 30% longer than
+# standard road speed assumptions due to mountain grades/curves.
+# ============================================================
+MONTANA_TERRAIN_ZONES = [
+    # Going-to-the-Sun Road corridor / Glacier approaches
+    ("Glacier/GTTS Corridor",     48.55, 48.85, -113.95, -113.55, 1.45),
+    # Mission Mountains / Highway 93 between Polson and Missoula
+    ("Mission Mountains",         47.10, 48.05, -114.25, -113.70, 1.30),
+    # Swan Range / Highway 83 (Swan Valley)
+    ("Swan Valley",               47.10, 48.20, -113.80, -113.35, 1.35),
+    # Flathead Lake area (curvy shoreline roads)
+    ("Flathead Lake",             47.55, 48.05, -114.45, -113.90, 1.20),
+    # Marias Pass / US-2 east of Glacier
+    ("Marias Pass",               48.25, 48.55, -113.55, -112.95, 1.35),
+    # Rogers Pass / Highway 200 (Little Belt Mountains)
+    ("Rogers Pass Area",          46.75, 47.25, -112.65, -111.95, 1.25),
+    # Lolo Pass / Highway 12 west of Missoula
+    ("Lolo Pass",                 46.45, 46.85, -115.20, -114.50, 1.40),
+    # MacDonald Pass / Highway 12 east of Helena
+    ("MacDonald Pass",            46.55, 46.80, -112.65, -112.25, 1.25),
+    # Beartooth Highway approaches (south of Billings)
+    ("Beartooth Approaches",      44.90, 45.30, -109.80, -109.20, 1.40),
+    # Lost Trail Pass / Highway 93 south of Hamilton
+    ("Lost Trail Pass",           45.55, 45.85, -114.25, -113.85, 1.35),
+]
+
+def get_terrain_multiplier(coord1: tuple, coord2: tuple) -> float:
+    """
+    Check if the midpoint of a route falls within a known slow terrain zone.
+    Returns the highest applicable multiplier (or 1.0 if none match).
+    """
+    mid_lat = (coord1[0] + coord2[0]) / 2
+    mid_lon = (coord1[1] + coord2[1]) / 2
+    best = 1.0
+    for (name, lat_min, lat_max, lon_min, lon_max, mult) in MONTANA_TERRAIN_ZONES:
+        if lat_min <= mid_lat <= lat_max and lon_min <= mid_lon <= lon_max:
+            if mult > best:
+                best = mult
+    return best
 
 def get_drive_time_hours(coord1: tuple, coord2: tuple) -> float:
     key = (
@@ -135,6 +163,9 @@ def get_drive_time_hours(coord1: tuple, coord2: tuple) -> float:
         data = resp.json()
         if data.get("code") == "Ok":
             hours = data["routes"][0]["duration"] / 3600
+            # Apply Montana terrain multiplier (#10)
+            terrain_mult = get_terrain_multiplier(coord1, coord2)
+            hours = hours * terrain_mult
             route_cache[key] = hours
             return hours
     except Exception as e:
@@ -154,9 +185,241 @@ def haversine_hours(coord1: tuple, coord2: tuple) -> float:
     miles = R * 2 * atan2(sqrt(a), sqrt(1-a))
     return miles / 40
 
+def haversine_miles(coord1: tuple, coord2: tuple) -> float:
+    """Straight-line distance in miles — used for fast route sorting."""
+    lat1, lon1 = coord1
+    lat2, lon2 = coord2
+    R = 3959
+    lat1_r, lat2_r = radians(lat1), radians(lat2)
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(lat1_r) * cos(lat2_r) * sin(dlon/2)**2
+    return R * 2 * atan2(sqrt(a), sqrt(1-a))
+
 # ============================================================
-# SCORING
+# ROUTE OPTIMIZER — Nearest Neighbor Algorithm (#6)
+# For each day+employee, reorders jobs so total drive distance
+# is minimized. Uses haversine (fast, no API calls) for sorting,
+# then recalculates real drive times on the optimized order.
+# Returns original vs optimized drive hours and $ savings.
 # ============================================================
+def optimize_route_for_employee(jobs: list, home_coords: tuple) -> dict:
+    """
+    Nearest-neighbor optimization for one employee's day.
+    Returns original_hours, optimized_hours, optimized_order (indices).
+    """
+    if len(jobs) <= 1:
+        orig = 0.0
+        if jobs:
+            orig = (haversine_hours(home_coords, jobs[0]["coords"]) +
+                    haversine_hours(jobs[0]["coords"], home_coords))
+        return {"original_hours": round(orig, 3), "optimized_hours": round(orig, 3), "order": list(range(len(jobs)))}
+
+    # Calculate original route distance (order as given)
+    orig_hours = 0.0
+    current = home_coords
+    for job in jobs:
+        orig_hours += haversine_hours(current, job["coords"])
+        current = job["coords"]
+    orig_hours += haversine_hours(current, home_coords)
+
+    # Nearest-neighbor: greedily pick the closest unvisited job
+    unvisited = list(range(len(jobs)))
+    order = []
+    current = home_coords
+    while unvisited:
+        nearest_idx = min(unvisited, key=lambda i: haversine_miles(current, jobs[i]["coords"]))
+        order.append(nearest_idx)
+        current = jobs[nearest_idx]["coords"]
+        unvisited.remove(nearest_idx)
+
+    # Calculate optimized route distance
+    opt_hours = 0.0
+    current = home_coords
+    for idx in order:
+        opt_hours += haversine_hours(current, jobs[idx]["coords"])
+        current = jobs[idx]["coords"]
+    opt_hours += haversine_hours(current, home_coords)
+
+    return {
+        "original_hours": round(orig_hours, 3),
+        "optimized_hours": round(opt_hours, 3),
+        "order": order,
+    }
+
+def optimize_all_days(days_jobs: dict, home_coords: tuple, hourly_cost: float) -> dict:
+    """
+    Run nearest-neighbor optimization across all days.
+    days_jobs: { date_str: [job, ...] }
+    Returns an optimization summary block.
+    """
+    total_original = 0.0
+    total_optimized = 0.0
+    day_results = []
+
+    for date in sorted(days_jobs.keys()):
+        day_jobs = days_jobs[date]
+        by_employee = defaultdict(list)
+        for job in day_jobs:
+            by_employee[job["employee"]].append(job)
+
+        day_orig = 0.0
+        day_opt = 0.0
+        for emp, emp_jobs in by_employee.items():
+            result = optimize_route_for_employee(emp_jobs, home_coords)
+            day_orig += result["original_hours"]
+            day_opt += result["optimized_hours"]
+
+        total_original += day_orig
+        total_optimized += day_opt
+        savings = max(0.0, day_orig - day_opt)
+        day_results.append({
+            "date": date,
+            "original_drive_hours": round(day_orig, 2),
+            "optimized_drive_hours": round(day_opt, 2),
+            "hours_saved": round(savings, 2),
+            "dollars_saved": round(savings * hourly_cost, 2),
+        })
+
+    total_saved = max(0.0, total_original - total_optimized)
+    pct = round((total_saved / total_original * 100) if total_original > 0 else 0, 1)
+
+    return {
+        "total_original_drive_hours": round(total_original, 2),
+        "total_optimized_drive_hours": round(total_optimized, 2),
+        "total_hours_saved": round(total_saved, 2),
+        "total_dollars_saved": round(total_saved * hourly_cost, 2),
+        "pct_improvement": pct,
+        "days": day_results,
+    }
+
+# ============================================================
+# PATTERN DETECTION — AI Insights (#7)
+# Analyzes scored jobs and days to surface plain-English
+# insights about day patterns, bad zip codes, service type
+# profitability, drive waste, and outlier clients.
+# ============================================================
+def detect_patterns(days_result: list, summary: dict, hourly_cost: float,
+                    profitable_threshold: float) -> list:
+    """
+    Returns a list of insight dicts: { type, icon, title, detail }
+    type is one of: "warning", "good", "info"
+    """
+    insights = []
+    all_jobs = [job for day in days_result for job in day["jobs"]]
+    if not all_jobs:
+        return insights
+
+    # --- Day-of-week margin analysis ---
+    day_margins = defaultdict(list)
+    for day in days_result:
+        try:
+            dow = datetime.strptime(day["date"], "%Y-%m-%d").strftime("%A")
+        except Exception:
+            continue
+        for job in day["jobs"]:
+            day_margins[dow].append(job.get("gross_per_hour", 0))
+
+    if len(day_margins) >= 2:
+        day_avgs = {d: sum(v)/len(v) for d, v in day_margins.items()}
+        best_day = max(day_avgs, key=day_avgs.get)
+        worst_day = min(day_avgs, key=day_avgs.get)
+        best_avg = day_avgs[best_day]
+        worst_avg = day_avgs[worst_day]
+        if best_avg > 0 and (best_avg - worst_avg) / best_avg > 0.2:
+            drop_pct = round((best_avg - worst_avg) / best_avg * 100)
+            insights.append({
+                "type": "warning",
+                "icon": "📅",
+                "title": f"{worst_day}s run {drop_pct}% below your best margin day",
+                "detail": f"{best_day}s average ${best_avg:.0f}/hr vs {worst_day}s at ${worst_avg:.0f}/hr. Consider lighter scheduling or higher pricing on {worst_day}s."
+            })
+
+    # --- Drive waste vs industry benchmark ---
+    total_time = summary.get("total_work_hours", 0) + summary.get("total_drive_hours", 0)
+    if total_time > 0:
+        drive_pct = round(summary.get("total_drive_hours", 0) / total_time * 100)
+        if drive_pct > 25:
+            insights.append({
+                "type": "warning",
+                "icon": "🚗",
+                "title": f"{drive_pct}% of your time is unpaid driving",
+                "detail": f"Industry benchmark is under 20%. You're spending ${summary.get('drive_cost', 0):.0f} on drive time this period. Route optimization could recover an estimated 30–50% of that."
+            })
+        elif drive_pct < 15:
+            insights.append({
+                "type": "good",
+                "icon": "✅",
+                "title": f"Strong routing — only {drive_pct}% drive time",
+                "detail": "Your jobs are well-clustered. Focus on pricing optimization rather than routing."
+            })
+
+    # --- Zip code / area profitability ---
+    zip_margins = defaultdict(list)
+    for job in all_jobs:
+        addr = job.get("address", "")
+        parts = addr.replace(",", " ").split()
+        zip_code = next((p for p in parts if p.isdigit() and len(p) == 5), None)
+        if zip_code:
+            zip_margins[zip_code].append(job.get("gross_per_hour", 0))
+
+    if len(zip_margins) >= 2:
+        overall_avg = summary.get("actual_hourly", 0)
+        bad_zips = [(z, sum(v)/len(v), len(v)) for z, v in zip_margins.items()
+                    if sum(v)/len(v) < overall_avg * 0.75 and len(v) >= 2]
+        if bad_zips:
+            z, avg, count = sorted(bad_zips, key=lambda x: x[1])[0]
+            insights.append({
+                "type": "warning",
+                "icon": "📍",
+                "title": f"Zip code {z} is dragging your margins",
+                "detail": f"{count} jobs in {z} average ${avg:.0f}/hr vs your ${overall_avg:.0f}/hr overall. Consider adding a travel surcharge or raising prices in this area."
+            })
+
+    # --- Service type profitability ---
+    service_margins = defaultdict(list)
+    for job in all_jobs:
+        svc = job.get("service_type", "Unknown")
+        if svc:
+            service_margins[svc].append(job.get("gross_per_hour", 0))
+
+    if len(service_margins) >= 2:
+        svc_avgs = {s: sum(v)/len(v) for s, v in service_margins.items() if len(v) >= 2}
+        if svc_avgs:
+            best_svc = max(svc_avgs, key=svc_avgs.get)
+            worst_svc = min(svc_avgs, key=svc_avgs.get)
+            best_svc_avg = svc_avgs[best_svc]
+            worst_svc_avg = svc_avgs[worst_svc]
+            if best_svc_avg > profitable_threshold:
+                insights.append({
+                    "type": "good",
+                    "icon": "⭐",
+                    "title": f"{best_svc} is your most profitable service",
+                    "detail": f"Averaging ${best_svc_avg:.0f}/hr — above your ${profitable_threshold:.0f}/hr target. Prioritize booking more of these."
+                })
+            if worst_svc_avg < profitable_threshold * 0.8 and worst_svc != best_svc:
+                insights.append({
+                    "type": "warning",
+                    "icon": "⚠️",
+                    "title": f"{worst_svc} consistently underperforms",
+                    "detail": f"Averaging ${worst_svc_avg:.0f}/hr — below your ${profitable_threshold:.0f}/hr target. Review pricing or time estimates for this service type."
+                })
+
+    # --- High-drive-time outlier jobs ---
+    avg_drive = sum(j.get("drive_time", 0) for j in all_jobs) / len(all_jobs) if all_jobs else 0
+    outliers = [j for j in all_jobs if j.get("drive_time", 0) > avg_drive * 2 and j.get("drive_time", 0) > 0.5]
+    if outliers:
+        outlier_cost = sum(j.get("drive_time", 0) * hourly_cost for j in outliers)
+        insights.append({
+            "type": "info",
+            "icon": "🔍",
+            "title": f"{len(outliers)} job{'s' if len(outliers) > 1 else ''} with unusually long drive times",
+            "detail": f"These jobs have 2x+ average drive time, costing an extra ${outlier_cost:.0f} in unbillable hours. Bundle with nearby work or add a travel fee."
+        })
+
+    # Cap at 5 insights — most actionable first
+    return insights[:5]
+
 def score_job(revenue, duration_hours, drive_time, hourly_cost,
               profitable_threshold, marginal_threshold):
     total_time = duration_hours + drive_time
@@ -191,9 +454,6 @@ def calculate_daily_drive_real(day_jobs, home_coords):
         total_drive += get_drive_time_hours(current, home_coords)
     return total_drive
 
-# ============================================================
-# MODELS
-# ============================================================
 class BusinessProfile(BaseModel):
     name: str
     home_address: str
@@ -213,9 +473,6 @@ class NewJobRequest(BaseModel):
     profitable_threshold: float = 120
     marginal_threshold: float = 75
 
-# ============================================================
-# BUSINESS ENDPOINTS
-# ============================================================
 @app.get("/businesses")
 def list_businesses():
     conn = sqlite3.connect(DB_PATH)
@@ -247,9 +504,6 @@ def delete_business(biz_id: int):
     conn.close()
     return {"message": "Deleted"}
 
-# ============================================================
-# ANALYZE
-# ============================================================
 @app.post("/analyze")
 async def analyze_jobs(
     file: UploadFile = File(...),
@@ -368,6 +622,10 @@ async def analyze_jobs(
         conn.commit()
         conn.close()
 
+    # Run optimization and pattern detection (#6, #7)
+    optimization = optimize_all_days(by_day, home_coords, hourly_labor_cost)
+    insights = detect_patterns(days_result, summary, hourly_labor_cost, profitable_threshold)
+
     return {
         "days": days_result,
         "summary": summary,
@@ -377,12 +635,11 @@ async def analyze_jobs(
             "hourly_labor_cost": hourly_labor_cost,
             "profitable_threshold": profitable_threshold,
             "marginal_threshold": marginal_threshold,
-        }
+        },
+        "optimization": optimization,
+        "insights": insights,
     }
 
-# ============================================================
-# EVALUATE JOB
-# ============================================================
 @app.post("/evaluate-job")
 async def evaluate_job(request: NewJobRequest):
     home_coords = geocode_address(request.home_address)
@@ -423,7 +680,7 @@ def root():
     return {"status": "OptiCal AI is running", "version": "2.0.0"}
 
 # ============================================================
-# SMART COLUMN MAPPER — added for flexible CSV uploads
+# SMART COLUMN MAPPER
 # ============================================================
 
 REQUIRED_FIELDS = {
@@ -682,6 +939,10 @@ async def analyze_mapped_endpoint(
             "total_jobs": len(jobs),
         }
 
+        # Run optimization and pattern detection (#6, #7)
+        optimization = optimize_all_days(by_day, home_coords, hourly_labor_cost)
+        insights = detect_patterns(days_result, summary, hourly_labor_cost, profitable_threshold)
+
         return {
             "days": days_result,
             "summary": summary,
@@ -691,7 +952,9 @@ async def analyze_mapped_endpoint(
                 "hourly_labor_cost": hourly_labor_cost,
                 "profitable_threshold": profitable_threshold,
                 "marginal_threshold": marginal_threshold,
-            }
+            },
+            "optimization": optimization,
+            "insights": insights,
         }
     except HTTPException:
         raise

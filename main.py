@@ -565,7 +565,9 @@ async def analyze_jobs(
                 hourly_labor_cost, profitable_threshold, marginal_threshold
             )
             scored_job = {**job, **s}
-            scored_job.pop("coords")
+            coords = scored_job.pop("coords")
+            scored_job["lat"] = round(coords[0], 6)
+            scored_job["lng"] = round(coords[1], 6)
             scored_jobs.append(scored_job)
             if s["classification"] == "RED":
                 red_jobs.append({
@@ -896,7 +898,9 @@ async def analyze_mapped_endpoint(
                     hourly_labor_cost, profitable_threshold, marginal_threshold
                 )
                 scored_job = {**job, **s}
-                scored_job.pop("coords")
+                coords = scored_job.pop("coords")
+                scored_job["lat"] = round(coords[0], 6)
+                scored_job["lng"] = round(coords[1], 6)
                 scored_jobs.append(scored_job)
                 if s["classification"] == "RED":
                     red_jobs.append({

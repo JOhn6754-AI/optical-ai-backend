@@ -421,3 +421,173 @@ async def evaluate_job(request: NewJobRequest):
 @app.get("/")
 def root():
     return {"status": "OptiCal AI is running", "version": "2.0.0"}
+
+# ============================================================
+# SMART COLUMN MAPPER — added for flexible CSV uploads
+# ============================================================
+
+REQUIRED_FIELDS = {
+    "date":     ["date", "job_date", "service_date", "scheduled", "appointment_date",
+                 "visit_date", "completed_date", "order_date", "booked"],
+    "client":   ["client", "customer", "name", "customer_name", "client_name",
+                 "account", "contact", "business_name", "company"],
+    "address":  ["address", "location", "service_address", "job_address",
+                 "street", "site", "property", "destination", "place"],
+    "service":  ["service", "service_type", "job_type", "type", "work_type",
+                 "category", "description", "job_description", "task"],
+    "revenue":  ["revenue", "price", "amount", "total", "charge", "invoice_amount",
+                 "total_amount", "billed", "fee", "cost", "rate", "payment"],
+    "duration": ["duration", "hours", "time", "minutes", "job_duration",
+                 "duration_minutes", "duration_hours", "length", "hrs"],
+    "employee": ["employee", "tech", "technician", "worker", "staff", "assigned_to",
+                 "rep", "team_member", "assigned", "operator"],
+}
+
+OPTIONAL_FIELDS = {
+    "notes":  ["notes", "comments", "memo", "details", "remarks"],
+    "status": ["status", "job_status", "state", "outcome", "result"],
+}
+
+def normalize(s: str) -> str:
+    return s.lower().strip().replace(" ", "").replace("_", "").replace("-", "")
+
+def score_column(col_name: str, aliases: list) -> float:
+    norm_col = normalize(col_name)
+    best = 0.0
+    for alias in aliases:
+        norm_alias = normalize(alias)
+        if norm_col == norm_alias:
+            return 1.0
+        if norm_alias in norm_col or norm_col in norm_alias:
+            score = len(norm_alias) / max(len(norm_col), len(norm_alias))
+            best = max(best, score * 0.9)
+    return best
+
+def detect_column_type(values: list) -> str:
+    non_empty = [v.strip() for v in values if v.strip()][:20]
+    if not non_empty:
+        return "text"
+    currency_hits = sum(1 for v in non_empty
+                        if v.startswith("$") or v.replace(",", "").replace(".", "").isdigit())
+    if currency_hits > len(non_empty) * 0.6:
+        return "currency"
+    number_hits = sum(1 for v in non_empty
+                      if v.replace(".", "").replace(",", "").isdigit())
+    if number_hits > len(non_empty) * 0.6:
+        return "number"
+    date_hits = sum(1 for v in non_empty
+                    if any(h in v for h in ["2024", "2025", "2026", "/", "-"]) and len(v) < 20)
+    if date_hits > len(non_empty) * 0.4:
+        return "date"
+    return "text"
+
+def smart_map_columns(headers: list, sample_rows: list) -> dict:
+    all_fields = {**REQUIRED_FIELDS, **OPTIONAL_FIELDS}
+    suggested = {}
+    confidence = {}
+    used_columns = set()
+
+    col_samples = {h: [] for h in headers}
+    for row in sample_rows[:20]:
+        for i, val in enumerate(row):
+            if i < len(headers):
+                col_samples[headers[i]].append(val)
+
+    score_matrix = {}
+    for field, aliases in all_fields.items():
+        col_scores = {}
+        for col in headers:
+            base_score = score_column(col, aliases)
+            col_type = detect_column_type(col_samples.get(col, []))
+            if field == "revenue" and col_type in ("currency", "number"):
+                base_score = min(1.0, base_score + 0.15)
+            if field == "duration" and col_type == "number":
+                base_score = min(1.0, base_score + 0.1)
+            if field == "date" and col_type == "date":
+                base_score = min(1.0, base_score + 0.15)
+            col_scores[col] = base_score
+        score_matrix[field] = col_scores
+
+    field_order = sorted(all_fields.keys(),
+                         key=lambda f: max(score_matrix[f].values(), default=0),
+                         reverse=True)
+
+    for field in field_order:
+        scores = score_matrix[field]
+        best_col = max(scores, key=scores.get)
+        best_score = scores[best_col]
+        if best_score > 0.3 and best_col not in used_columns:
+            suggested[field] = best_col
+            confidence[field] = round(best_score, 2)
+            used_columns.add(best_col)
+
+    return {
+        "suggested": suggested,
+        "confidence": confidence,
+        "unmapped_required": [f for f in REQUIRED_FIELDS if f not in suggested],
+        "needs_review": [f for f, c in confidence.items() if c < 0.75 and f in REQUIRED_FIELDS],
+        "unmapped_columns": [c for c in headers if c not in used_columns],
+        "all_columns": headers,
+    }
+
+
+class ColumnMapping(BaseModel):
+    date: Optional[str] = None
+    client: Optional[str] = None
+    address: Optional[str] = None
+    service: Optional[str] = None
+    revenue: Optional[str] = None
+    duration: Optional[str] = None
+    employee: Optional[str] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+
+class MappedAnalysisRequest(BaseModel):
+    csv_data: str
+    mapping: ColumnMapping
+
+
+@app.post("/map-columns")
+async def map_columns_endpoint(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
+        text = content.decode("utf-8-sig")
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        if len(rows) < 2:
+            raise HTTPException(status_code=400, detail="CSV needs at least a header row and one data row.")
+        headers = [h.strip() for h in rows[0]]
+        if len(headers) < 2:
+            raise HTTPException(status_code=400, detail="Only found one column — is this a comma-separated file?")
+        sample_rows = rows[1:6]
+        result = smart_map_columns(headers, sample_rows)
+        result["filename"] = file.filename
+        result["total_rows"] = len(rows) - 1
+        result["csv_content"] = text
+        result["sample_rows"] = sample_rows
+        return result
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Could not read file. Save it as CSV (UTF-8) and try again.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze-mapped")
+async def analyze_mapped_endpoint(request: MappedAnalysisRequest):
+    try:
+        reader = csv.DictReader(io.StringIO(request.csv_data))
+        raw_rows = list(reader)
+        if not raw_rows:
+            raise HTTPException(status_code=400, detail="No data rows found.")
+        mapping = {k: v for k, v in request.mapping.dict().items() if v}
+        normalized_rows = []
+        for row in raw_rows:
+            normalized = {}
+            for standard_name, user_col in mapping.items():
+                normalized[standard_name] = row.get(user_col, "").strip()
+            normalized_rows.append(normalized)
+        # Pass to your existing analysis — rename columns to match what /analyze expects
+        # then call your existing logic here
+        return {"status": "ok", "rows": len(normalized_rows), "sample": normalized_rows[:2]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

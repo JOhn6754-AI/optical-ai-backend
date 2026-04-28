@@ -573,21 +573,127 @@ async def map_columns_endpoint(file: UploadFile = File(...)):
 
 
 @app.post("/analyze-mapped")
-async def analyze_mapped_endpoint(request: MappedAnalysisRequest):
+async def analyze_mapped_endpoint(
+    request: MappedAnalysisRequest,
+    hourly_labor_cost: float = 85,
+    profitable_threshold: float = 120,
+    marginal_threshold: float = 75,
+    home_address: str = "506 Main St Kalispell MT 59901",
+    business_id: Optional[int] = None,
+):
     try:
         reader = csv.DictReader(io.StringIO(request.csv_data))
         raw_rows = list(reader)
         if not raw_rows:
             raise HTTPException(status_code=400, detail="No data rows found.")
+
         mapping = {k: v for k, v in request.mapping.dict().items() if v}
-        normalized_rows = []
+
+        jobs = []
         for row in raw_rows:
-            normalized = {}
-            for standard_name, user_col in mapping.items():
-                normalized[standard_name] = row.get(user_col, "").strip()
-            normalized_rows.append(normalized)
-        # Pass to your existing analysis — rename columns to match what /analyze expects
-        # then call your existing logic here
-        return {"status": "ok", "rows": len(normalized_rows), "sample": normalized_rows[:2]}
+            try:
+                address = row.get(mapping.get("address", ""), "").strip()
+                revenue_raw = row.get(mapping.get("revenue", ""), "0").strip().replace("$", "").replace(",", "")
+                duration_raw = row.get(mapping.get("duration", ""), "0").strip()
+                jobs.append({
+                    "date": row.get(mapping.get("date", ""), "").strip(),
+                    "client_name": row.get(mapping.get("client", ""), "").strip(),
+                    "address": address,
+                    "service_type": row.get(mapping.get("service", ""), "").strip(),
+                    "revenue": float(revenue_raw) if revenue_raw else 0,
+                    "duration_hours": float(duration_raw) if duration_raw else 0,
+                    "employee": row.get(mapping.get("employee", ""), "").strip(),
+                    "coords": geocode_address(address),
+                })
+            except (ValueError, KeyError) as e:
+                continue
+
+        if not jobs:
+            raise HTTPException(status_code=400, detail="No valid jobs found after mapping.")
+
+        home_coords = geocode_address(home_address)
+        by_day = defaultdict(list)
+        for job in jobs:
+            by_day[job["date"]].append(job)
+
+        days_result = []
+        total_revenue = 0
+        total_work_hours = 0
+        total_drive_hours = 0
+        red_jobs = []
+
+        for date in sorted(by_day.keys()):
+            day_jobs = by_day[date]
+            drive_time = calculate_daily_drive_real(day_jobs, home_coords)
+            drive_per_job = drive_time / len(day_jobs) if day_jobs else 0
+            day_revenue = sum(j["revenue"] for j in day_jobs)
+            day_work = sum(j["duration_hours"] for j in day_jobs)
+            total_revenue += day_revenue
+            total_work_hours += day_work
+            total_drive_hours += drive_time
+
+            scored_jobs = []
+            for job in day_jobs:
+                s = score_job(
+                    job["revenue"], job["duration_hours"], drive_per_job,
+                    hourly_labor_cost, profitable_threshold, marginal_threshold
+                )
+                scored_job = {**job, **s}
+                scored_job.pop("coords")
+                scored_jobs.append(scored_job)
+                if s["classification"] == "RED":
+                    red_jobs.append({
+                        "client_name": job["client_name"],
+                        "service_type": job["service_type"],
+                        "revenue": job["revenue"],
+                        "gross_per_hour": s["gross_per_hour"],
+                        "suggested_price": round(profitable_threshold * s["total_time"], 2),
+                        "surcharge_needed": round(profitable_threshold * s["total_time"] - job["revenue"], 2),
+                    })
+
+            date_obj = datetime.strptime(date, "%Y-%m-%d") if date else datetime.now()
+            days_result.append({
+                "date": date,
+                "day_name": date_obj.strftime("%A, %B %d"),
+                "jobs": scored_jobs,
+                "day_revenue": round(day_revenue, 2),
+                "day_work_hours": round(day_work, 2),
+                "day_drive_hours": round(drive_time, 2),
+            })
+
+        drive_cost = total_drive_hours * hourly_labor_cost
+        total_time = total_work_hours + total_drive_hours
+        actual_hourly = total_revenue / total_time if total_time > 0 else 0
+        potential_hourly = total_revenue / total_work_hours if total_work_hours > 0 else 0
+        money_left = (potential_hourly - actual_hourly) * total_work_hours
+        annual_waste = drive_cost * 50
+
+        summary = {
+            "total_revenue": round(total_revenue, 2),
+            "total_work_hours": round(total_work_hours, 2),
+            "total_drive_hours": round(total_drive_hours, 2),
+            "drive_cost": round(drive_cost, 2),
+            "actual_hourly": round(actual_hourly, 2),
+            "potential_hourly": round(potential_hourly, 2),
+            "money_left_on_table": round(money_left, 2),
+            "annual_drive_waste": round(annual_waste, 2),
+            "annual_recoverable": round(annual_waste * 0.4, 2),
+            "red_job_count": len(red_jobs),
+            "total_jobs": len(jobs),
+        }
+
+        return {
+            "days": days_result,
+            "summary": summary,
+            "red_jobs": red_jobs,
+            "geocoding": "real",
+            "config": {
+                "hourly_labor_cost": hourly_labor_cost,
+                "profitable_threshold": profitable_threshold,
+                "marginal_threshold": marginal_threshold,
+            }
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
